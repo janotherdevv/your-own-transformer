@@ -3,7 +3,6 @@ import torch.nn as nn  # Módulo de redes neuronales: capas, funciones de activa
 import torch.optim as optim  # Algoritmos de optimización: Adam, SGD, etc.
 from torch.utils.data import Dataset, DataLoader  # Dataset y DataLoader para manejar datos
 import math  # Funciones matemáticas: sqrt, log, etc.
-import copy  # Copias profundas de objetos
 from datasets import load_dataset  # HuggingFace datasets: carga datasets públicos en una línea
 from collections import Counter  # Cuenta frecuencias de palabras para construir el vocabulario
 import os    # Para comprobar si existe el archivo del modelo guardado
@@ -486,36 +485,8 @@ class Transformer(nn.Module):
         return output
 
 # =============================================================================
-# PASO 5: PREPARAR DATOS DE EJEMPLO
+# TOKENS ESPECIALES — definidos aquí, antes de las funciones que los usan
 # =============================================================================
-# Hiperparámetros del modelo: definen la arquitectura y capacidad
-## NOTA: Los valores del paper original están diseñados para GPU.
-## En CPU petan la RAM (~2.5GB en pico). Aquí usamos GPU si está disponible.
-##
-## Comparativa de memoria:
-##   GPU (VRAM, este):  batch=64, seq=100, d=512, layers=6  → ~2.5GB VRAM  ✓ cabe en RTX 3060
-##   CPU (RAM):         batch=64, seq=100, d=512, layers=6  → ~2.5GB RAM   ✗ puede congelar el PC
-
-# Detectar si hay GPU disponible y usarla automáticamente.
-# device = "cuda" si hay GPU con CUDA, "cpu" si no hay.
-# Todo lo que vaya a la GPU (modelo, datos) debe estar en el mismo device.
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Usando device: {device}")
-
-src_vocab_size = 5000   # Tamaño del vocabulario español: 5000 palabras distintas conocidas
-tgt_vocab_size = 5000   # Tamaño del vocabulario inglés: 5000 palabras distintas conocidas
-d_model = 512           # Cada palabra se representa como un vector de 512 números
-num_heads = 8           # La atención se divide en 8 "cabezas" paralelas
-num_layers = 6          # El Encoder y el Decoder tienen 6 capas cada uno
-d_ff = 2048             # La red feed-forward interna usa vectores de 2048 (4x d_model)
-max_seq_length = 100    # Las frases pueden tener como máximo 100 tokens
-dropout = 0.1           # Durante el entrenamiento, se apagan aleatoriamente el 10% de neuronas
-
-# Instanciar el modelo y moverlo al device (GPU o CPU).
-# .to(device) copia todos los pesos del modelo a la memoria del device elegido.
-transformer = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout).to(device)
-
-# --- TOKENS ESPECIALES ---
 # El vocabulario reserva los primeros 4 índices para tokens de control:
 #   0 = <PAD>  padding: relleno para frases cortas (ignorado por CrossEntropyLoss)
 #   1 = <SOS>  start of sequence: marca el inicio de cada frase
@@ -527,25 +498,15 @@ SOS_IDX = 1
 EOS_IDX = 2
 UNK_IDX = 3
 
-# --- CARGAR DATASET REAL ---
-# opus_books: traducciones de libros literarios español <-> inglés
-# ~130k pares de frases, texto real de alta calidad.
-# HuggingFace lo descarga y cachea automáticamente en ~/.cache/huggingface/
-print("Cargando dataset opus_books es-en...", flush=True)
-dataset = load_dataset("opus_books", "en-es")
-train_data = dataset["train"]
-
-# Extraer las frases en cada idioma del dataset.
-# La estructura de opus_books es: train_data["translation"] = [{"es": "...", "en": "..."}, ...]
-src_sentences = [item["es"] for item in train_data["translation"]]
-tgt_sentences = [item["en"] for item in train_data["translation"]]
-print(f"Frases cargadas: {len(src_sentences)}", flush=True)
+# =============================================================================
+# PASO 5: PREPARAR DATOS
+# =============================================================================
 
 # --- CONSTRUIR VOCABULARIOS ---
 # Un vocabulario es un diccionario palabra -> índice.
 # Ejemplo: {"<PAD>": 0, "<SOS>": 1, ..., "gato": 47, "perro": 83, ...}
 #
-# Usamos las src_vocab_size-4 palabras MÁS FRECUENTES del corpus.
+# Usamos las max_size-4 palabras MÁS FRECUENTES del corpus.
 # Las palabras raras (poco frecuentes) se mapean a <UNK>.
 def build_vocab(sentences, max_size):
     # Tokenización simple: minúsculas + separar por espacios
@@ -558,13 +519,6 @@ def build_vocab(sentences, max_size):
     for word, _ in counter.most_common(max_size - 4):
         vocab[word] = len(vocab)
     return vocab
-
-print("Construyendo vocabulario español...", flush=True)
-src_vocab = build_vocab(src_sentences, src_vocab_size)
-print(f"Vocabulario español listo: {len(src_vocab)} palabras", flush=True)
-print("Construyendo vocabulario inglés...", flush=True)
-tgt_vocab = build_vocab(tgt_sentences, tgt_vocab_size)
-print(f"Vocabulario inglés listo:  {len(tgt_vocab)} palabras", flush=True)
 
 # --- CODIFICAR FRASES ---
 # Convierte una frase de texto a una lista de índices enteros, con padding.
@@ -591,20 +545,19 @@ def encode(sentence, vocab, max_len):
 # iterar sobre ella y crear batches automáticamente.
 class TranslationDataset(Dataset):
     def __init__(self, src_sentences, tgt_sentences, src_vocab, tgt_vocab, max_len):
-        total = len(src_sentences)
-        print(f"Codificando {total} frases españolas...", flush=True)
-        self.src = []
-        for i, s in enumerate(src_sentences):
-            self.src.append(encode(s, src_vocab, max_len))
-            if (i + 1) % 10000 == 0:
-                print(f"  ES: {i+1}/{total} frases codificadas", flush=True)
+        # Helper interno para no duplicar el bucle de codificación ES/EN
+        def encode_sentences(sentences, vocab, label):
+            total = len(sentences)
+            print(f"Codificando {total} frases ({label})...", flush=True)
+            result = []
+            for i, s in enumerate(sentences):
+                result.append(encode(s, vocab, max_len))
+                if (i + 1) % 10000 == 0:
+                    print(f"  {label}: {i+1}/{total} frases codificadas", flush=True)
+            return result
 
-        print(f"Codificando {total} frases inglesas...", flush=True)
-        self.tgt = []
-        for i, s in enumerate(tgt_sentences):
-            self.tgt.append(encode(s, tgt_vocab, max_len))
-            if (i + 1) % 10000 == 0:
-                print(f"  EN: {i+1}/{total} frases codificadas", flush=True)
+        self.src = encode_sentences(src_sentences, src_vocab, "ES")
+        self.tgt = encode_sentences(tgt_sentences, tgt_vocab, "EN")
 
     def __len__(self):
         # Cuántos pares de frases tiene el dataset
@@ -614,48 +567,62 @@ class TranslationDataset(Dataset):
         # Devuelve el par (frase española, frase inglesa) en el índice idx
         return self.src[idx], self.tgt[idx]
 
-# Crear el dataset y el DataLoader.
-# DataLoader divide el dataset en batches y los baraja en cada época.
-#   batch_size=32: 32 pares de frases por paso de entrenamiento
-#   shuffle=True: barajar el dataset en cada época para evitar que el modelo
-#                 aprenda el orden de los datos
-translation_dataset = TranslationDataset(src_sentences, tgt_sentences, src_vocab, tgt_vocab, max_seq_length)
-dataloader = DataLoader(translation_dataset, batch_size=32, shuffle=True)
-print(f"Dataset listo: {len(translation_dataset)} pares | {len(dataloader)} batches por época", flush=True)
+# =============================================================================
+# CONFIGURACIÓN E HIPERPARÁMETROS
+# =============================================================================
+## NOTA: Los valores del paper original están diseñados para GPU.
+## En CPU petan la RAM (~2.5GB en pico). Aquí usamos GPU si está disponible.
+##
+## Comparativa de memoria:
+##   GPU (VRAM, este):  batch=64, seq=100, d=512, layers=6  → ~2.5GB VRAM  ✓ cabe en RTX 3060
+##   CPU (RAM):         batch=64, seq=100, d=512, layers=6  → ~2.5GB RAM   ✗ puede congelar el PC
+
+# Detectar si hay GPU disponible y usarla automáticamente.
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Usando device: {device}", flush=True)
+
+src_vocab_size = 5000   # Tamaño del vocabulario español: 5000 palabras distintas conocidas
+tgt_vocab_size = 5000   # Tamaño del vocabulario inglés: 5000 palabras distintas conocidas
+d_model = 512           # Cada palabra se representa como un vector de 512 números
+num_heads = 8           # La atención se divide en 8 "cabezas" paralelas
+num_layers = 6          # El Encoder y el Decoder tienen 6 capas cada uno
+d_ff = 2048             # La red feed-forward interna usa vectores de 2048 (4x d_model)
+max_seq_length = 100    # Las frases pueden tener como máximo 100 tokens
+dropout = 0.1           # Durante el entrenamiento, se apagan aleatoriamente el 10% de neuronas
+
+# Rutas de los archivos donde se guarda el modelo y los vocabularios
+MODEL_PATH    = "transformer_model.pt"  # Pesos del modelo (los millones de parámetros)
+SRC_VOCAB_PATH = "src_vocab.json"       # Diccionario español -> índice
+TGT_VOCAB_PATH = "tgt_vocab.json"       # Diccionario inglés  -> índice
+
+# Instanciar el modelo vacío y moverlo al device.
+# .to(device) copia todos los pesos del modelo a la memoria del device elegido.
+transformer = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout).to(device)
 
 # =============================================================================
-# PASO 6: ENTRENAR EL MODELO (o cargar uno ya entrenado)
+# PASO 6: CARGAR MODELO O ENTRENAR DESDE CERO
 # =============================================================================
-
-# Rutas de los archivos donde se guarda el modelo y los vocabularios.
-# Se guardan en la misma carpeta que el script.
-MODEL_PATH = "transformer_model.pt"    # Pesos del modelo (los millones de parámetros)
-SRC_VOCAB_PATH = "src_vocab.json"      # Diccionario español -> índice
-TGT_VOCAB_PATH = "tgt_vocab.json"      # Diccionario inglés  -> índice
+# El check de modelo guardado va LO PRIMERO, antes de cargar el dataset.
+# Si ya existe el modelo, no tiene sentido descargar y procesar 93k frases
+# solo para descartarlas. Eso costaba ~45 segundos innecesarios en cada arranque.
+#
+# Ejemplo humano: es como un estudiante que ya tiene el título.
+# Si lo tiene en casa, no necesita volver a estudiar. Solo saca el título.
 
 # CrossEntropyLoss: función de pérdida para clasificación multiclase.
-# En cada posición, el modelo predice una distribución sobre 5000 palabras.
-# ignore_index=0: ignora el token de padding al calcular el error,
-# porque el padding no es una palabra real y no debería penalizarse.
+# ignore_index=0: ignora los tokens de padding al calcular el error.
 criterion = nn.CrossEntropyLoss(ignore_index=0)
 
 # Optimizador Adam con los hiperparámetros del paper original "Attention is All You Need":
-#   lr=0.0001:        tasa de aprendizaje (cuánto se ajustan los pesos en cada paso)
-#   betas=(0.9, 0.98): coeficientes para las medias móviles de gradientes (momentum)
-#   eps=1e-9:         término de estabilidad numérica para evitar división por cero
+#   lr=0.0001:         tasa de aprendizaje
+#   betas=(0.9, 0.98): medias móviles de gradientes (momentum)
+#   eps=1e-9:          estabilidad numérica para evitar división por cero
 optimizer = optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
 
-# --- COMPROBAR SI YA EXISTE UN MODELO GUARDADO ---
-# Si los tres archivos existen, cargamos el modelo y los vocabularios directamente
-# y nos saltamos todo el entrenamiento. Si no, entrenamos desde cero.
-#
-# Ejemplo humano: es como un estudiante que ya ha pasado el examen.
-# Si tiene el título guardado en casa, no necesita volver a estudiar.
-# Solo saca el título y listo.
 if os.path.exists(MODEL_PATH) and os.path.exists(SRC_VOCAB_PATH) and os.path.exists(TGT_VOCAB_PATH):
     print(f"Modelo encontrado en '{MODEL_PATH}'. Cargando pesos...", flush=True)
 
-    # Cargar los vocabularios desde JSON
+    # Cargar vocabularios desde JSON
     with open(SRC_VOCAB_PATH, "r") as f:
         src_vocab = json.load(f)
     with open(TGT_VOCAB_PATH, "r") as f:
@@ -665,21 +632,44 @@ if os.path.exists(MODEL_PATH) and os.path.exists(SRC_VOCAB_PATH) and os.path.exi
     # map_location=device: si el modelo se guardó en GPU pero ahora solo hay CPU
     # (o viceversa), PyTorch lo recoloca automáticamente en el device correcto.
     transformer.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-
     print("Modelo cargado correctamente. Listo para traducir sin reentrenar.", flush=True)
 
 else:
-    print("No se encontró modelo guardado. Iniciando entrenamiento desde cero...", flush=True)
+    print("No se encontró modelo guardado. Cargando dataset e iniciando entrenamiento...", flush=True)
 
-    # Poner el modelo en modo entrenamiento: activa dropout y otras capas de regularización.
-    # (En modo evaluación/inferencia se usa transformer.eval(), que las desactiva)
-    transformer.train()
+    # --- CARGAR DATASET ---
+    # opus_books: traducciones de libros literarios español <-> inglés
+    # ~93k pares de frases, texto real de alta calidad.
+    # HuggingFace lo descarga y cachea en ~/.cache/huggingface/
+    print("Cargando dataset opus_books es-en...", flush=True)
+    dataset = load_dataset("opus_books", "en-es")
+    train_data = dataset["train"]
 
-    # Bucle de entrenamiento: 10 épocas
-    # Con datos reales, una época = ver los ~130k pares de frases una vez completa.
-    # Cada época tiene ~4000 batches de 32 frases cada uno.
+    # La estructura es: train_data["translation"] = [{"es": "...", "en": "..."}, ...]
+    src_sentences = [item["es"] for item in train_data["translation"]]
+    tgt_sentences = [item["en"] for item in train_data["translation"]]
+    print(f"Frases cargadas: {len(src_sentences)}", flush=True)
+
+    # --- CONSTRUIR VOCABULARIOS ---
+    print("Construyendo vocabulario español...", flush=True)
+    src_vocab = build_vocab(src_sentences, src_vocab_size)
+    print(f"Vocabulario español listo: {len(src_vocab)} palabras", flush=True)
+    print("Construyendo vocabulario inglés...", flush=True)
+    tgt_vocab = build_vocab(tgt_sentences, tgt_vocab_size)
+    print(f"Vocabulario inglés listo:  {len(tgt_vocab)} palabras", flush=True)
+
+    # --- CREAR DATASET Y DATALOADER ---
+    # DataLoader divide el dataset en batches y los baraja en cada época.
+    #   batch_size=32: 32 pares de frases por paso de entrenamiento
+    #   shuffle=True:  barajar en cada época para no aprender el orden de los datos
+    translation_dataset = TranslationDataset(src_sentences, tgt_sentences, src_vocab, tgt_vocab, max_seq_length)
+    dataloader = DataLoader(translation_dataset, batch_size=32, shuffle=True)
+    print(f"Dataset listo: {len(translation_dataset)} pares | {len(dataloader)} batches por época", flush=True)
+
+    # --- BUCLE DE ENTRENAMIENTO ---
+    # 10 épocas: una época = ver los ~93k pares de frases una vez completa.
     for epoch in range(10):
-        transformer.train()
+        transformer.train()  # Activar dropout para entrenamiento
         epoch_loss = 0  # Acumular el loss de todos los batches para hacer la media
 
         for batch_idx, (src_batch, tgt_batch) in enumerate(dataloader):
@@ -725,26 +715,19 @@ else:
             if (batch_idx + 1) % 100 == 0:
                 print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f}", flush=True)
 
-        # Al final de cada época, mostrar el loss medio de toda la época
         avg_loss = epoch_loss / len(dataloader)
         print(f"Epoch {epoch+1} completada | Loss medio: {avg_loss:.4f}", flush=True)
 
-    # --- GUARDAR EL MODELO Y LOS VOCABULARIOS ---
-    # Se ejecuta UNA SOLA VEZ al terminar el entrenamiento.
-    #
-    # torch.save guarda el "state_dict": un diccionario con todos los pesos del modelo.
+    # --- GUARDAR MODELO Y VOCABULARIOS ---
+    # torch.save guarda el "state_dict": todos los pesos del modelo.
     # No guarda la arquitectura (la clase Transformer), solo los números aprendidos.
     # Por eso al cargar hay que crear primero el modelo vacío y luego meterle los pesos.
     #
-    # Ejemplo humano: es como guardar solo las respuestas memorizadas del estudiante,
-    # no su cerebro completo. Para usarlas, necesitas un cerebro vacío (la clase)
-    # donde meterlas.
+    # Ejemplo humano: es como guardar las respuestas memorizadas del estudiante,
+    # no su cerebro completo. Para usarlas, necesitas un cerebro vacío (la clase).
     print(f"\nGuardando modelo en '{MODEL_PATH}'...", flush=True)
     torch.save(transformer.state_dict(), MODEL_PATH)
 
-    # Guardar los vocabularios en JSON para poder leerlos en el futuro.
-    # Sin los vocabularios, los pesos del modelo son inútiles: no sabrías
-    # cómo convertir palabras a índices ni índices a palabras.
     with open(SRC_VOCAB_PATH, "w") as f:
         json.dump(src_vocab, f)
     with open(TGT_VOCAB_PATH, "w") as f:
@@ -757,18 +740,24 @@ else:
 # PASO 7: USAR EL MODELO PARA TRADUCIR
 # =============================================================================
 
+# idx_to_word se construye UNA SOLA VEZ aquí, fuera de translate().
+# Es el vocabulario inverso: índice -> palabra, para decodificar la salida del modelo.
+# Construirlo dentro de translate() lo recrearía en cada llamada (ineficiente).
+# Ejemplo: {0: "<PAD>", 1: "<SOS>", 2: "<EOS>", 47: "cat", 83: "sleeps", ...}
+idx_to_word = {idx: word for word, idx in tgt_vocab.items()}
+
 def translate(sentence):
     """
     Traduce una frase del español al inglés usando el modelo entrenado.
 
     El proceso es el inverso al entrenamiento:
-      1. Convertir la frase española a una lista de índices (igual que en el entrenamiento)
+      1. Convertir la frase española a una lista de índices
       2. Pasarla por el encoder para obtener la representación interna
       3. El decoder genera la traducción TOKEN A TOKEN:
            - Empieza con <SOS>
            - En cada paso predice el token más probable y lo añade a la salida
            - Para cuando genera <EOS> o llega a max_seq_length
-      4. Convertir los índices de vuelta a palabras usando el vocabulario inverso
+      4. Convertir los índices de vuelta a palabras con idx_to_word
 
     Esto se llama GREEDY DECODING: en cada paso escoge el token con mayor
     probabilidad. No es el mejor método (beam search es mejor) pero es el más simple.
@@ -777,12 +766,6 @@ def translate(sentence):
     como si dictara en voz alta: "the... cat... sleeps... <fin>"
     """
     transformer.eval()  # Desactivar dropout para inferencia
-
-    # Construir vocabulario inverso: índice -> palabra
-    # Durante el entrenamiento usábamos palabra -> índice para codificar.
-    # Ahora necesitamos el sentido contrario para decodificar la salida del modelo.
-    # Ejemplo: {0: "<PAD>", 1: "<SOS>", 2: "<EOS>", 47: "cat", 83: "sleeps", ...}
-    idx_to_word = {idx: word for word, idx in tgt_vocab.items()}
 
     # Paso 1: Codificar la frase española a tensor [1, max_seq_length]
     # unsqueeze(0) añade la dimensión de batch: [max_seq_length] -> [1, max_seq_length]
@@ -812,37 +795,41 @@ def translate(sentence):
             if next_token == EOS_IDX:
                 break
 
-    # Paso 3: Convertir los índices a palabras
-    # Saltar <SOS> (primer token) y <EOS> (último token si existe)
+    # Paso 3: Convertir los índices a palabras (usando idx_to_word pre-construido)
+    # Saltar <SOS> (primer token) y filtrar <EOS> y <PAD>
     words = [
         idx_to_word.get(idx, "<UNK>")
-        for idx in generated_tokens[1:]  # saltar <SOS>
+        for idx in generated_tokens[1:]   # saltar <SOS>
         if idx not in (EOS_IDX, PAD_IDX)  # saltar <EOS> y <PAD>
     ]
     return " ".join(words)
 
 
-# --- EJEMPLOS DE TRADUCCIÓN ---
-print("\n--- Probando el modelo ---", flush=True)
-test_sentences = [
-    "el gato duerme en la cama",
-    "buenos días, ¿cómo estás?",
-    "me gusta el café por la mañana",
-    "el libro está sobre la mesa",
-    "hoy hace mucho calor",
-]
-for sentence in test_sentences:
-    translation = translate(sentence)
-    print(f"ES: {sentence}", flush=True)
-    print(f"EN: {translation}", flush=True)
-    print(flush=True)
+# Proteger el código interactivo con __main__ para que el archivo sea importable.
+# Sin esta guarda, cualquier `import` del archivo ejecutaría el modo interactivo
+# y bloquearía el proceso (ej: desde un notebook Jupyter o desde otro script).
+if __name__ == "__main__":
+    # --- EJEMPLOS DE TRADUCCIÓN ---
+    print("\n--- Probando el modelo ---", flush=True)
+    test_sentences = [
+        "el gato duerme en la cama",
+        "buenos días, ¿cómo estás?",
+        "me gusta el café por la mañana",
+        "el libro está sobre la mesa",
+        "hoy hace mucho calor",
+    ]
+    for sentence in test_sentences:
+        translation = translate(sentence)
+        print(f"ES: {sentence}", flush=True)
+        print(f"EN: {translation}", flush=True)
+        print(flush=True)
 
-# --- MODO INTERACTIVO ---
-# Permite escribir frases y traducirlas en tiempo real
-print("--- Modo interactivo (escribe 'salir' para terminar) ---", flush=True)
-while True:
-    sentence = input("ES > ").strip()
-    if sentence.lower() == "salir":
-        break
-    if sentence:
-        print(f"EN > {translate(sentence)}\n")
+    # --- MODO INTERACTIVO ---
+    # Permite escribir frases y traducirlas en tiempo real
+    print("--- Modo interactivo (escribe 'salir' para terminar) ---", flush=True)
+    while True:
+        sentence = input("ES > ").strip()
+        if sentence.lower() == "salir":
+            break
+        if sentence:
+            print(f"EN > {translate(sentence)}\n")
