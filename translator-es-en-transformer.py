@@ -4,6 +4,8 @@ import torch.optim as optim  # Algoritmos de optimización: Adam, SGD, etc.
 from torch.utils.data import Dataset, DataLoader  # Dataset y DataLoader para manejar datos
 import math  # Funciones matemáticas: sqrt, log, etc.
 import copy  # Copias profundas de objetos
+from datasets import load_dataset  # HuggingFace datasets: carga datasets públicos en una línea
+from collections import Counter  # Cuenta frecuencias de palabras para construir el vocabulario
 
 class MultiHeadAttention(nn.Module):
     """
@@ -511,22 +513,103 @@ dropout = 0.1           # Durante el entrenamiento, se apagan aleatoriamente el 
 # .to(device) copia todos los pesos del modelo a la memoria del device elegido.
 transformer = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout).to(device)
 
-# --- DATOS DE JUGUETE (toy dataset) ---
-# En la vida real tendrías pares de frases reales:
-#   "El gato duerme"  ->  diccionario español  ->  [42, 187, 63]
-#   "The cat sleeps"  ->  diccionario inglés   ->  [15, 93, 201]
+# --- TOKENS ESPECIALES ---
+# El vocabulario reserva los primeros 4 índices para tokens de control:
+#   0 = <PAD>  padding: relleno para frases cortas (ignorado por CrossEntropyLoss)
+#   1 = <SOS>  start of sequence: marca el inicio de cada frase
+#   2 = <EOS>  end of sequence: marca el final de cada frase
+#   3 = <UNK>  unknown: cualquier palabra que no esté en el vocabulario
+# Las palabras reales empiezan desde el índice 4.
+PAD_IDX = 0
+SOS_IDX = 1
+EOS_IDX = 2
+UNK_IDX = 3
+
+# --- CARGAR DATASET REAL ---
+# opus_books: traducciones de libros literarios español <-> inglés
+# ~130k pares de frases, texto real de alta calidad.
+# HuggingFace lo descarga y cachea automáticamente en ~/.cache/huggingface/
+print("Cargando dataset opus_books es-en...")
+dataset = load_dataset("opus_books", "es-en")
+train_data = dataset["train"]
+
+# Extraer las frases en cada idioma del dataset.
+# La estructura de opus_books es: train_data["translation"] = [{"es": "...", "en": "..."}, ...]
+src_sentences = [item["es"] for item in train_data["translation"]]
+tgt_sentences = [item["en"] for item in train_data["translation"]]
+print(f"Frases cargadas: {len(src_sentences)}")
+
+# --- CONSTRUIR VOCABULARIOS ---
+# Un vocabulario es un diccionario palabra -> índice.
+# Ejemplo: {"<PAD>": 0, "<SOS>": 1, ..., "gato": 47, "perro": 83, ...}
 #
-# Aquí simulamos eso con números aleatorios entre 1 y 4999.
-# El 0 está excluido porque está RESERVADO para padding (relleno de frases cortas).
-# Forma resultante: (64 frases, 100 tokens por frase)
+# Usamos las src_vocab_size-4 palabras MÁS FRECUENTES del corpus.
+# Las palabras raras (poco frecuentes) se mapean a <UNK>.
+def build_vocab(sentences, max_size):
+    # Tokenización simple: minúsculas + separar por espacios
+    # En producción se usaría un tokenizador real (BPE, WordPiece, etc.)
+    counter = Counter()
+    for sentence in sentences:
+        counter.update(sentence.lower().split())
+    # Empezar con los tokens especiales, luego añadir las palabras más comunes
+    vocab = {"<PAD>": PAD_IDX, "<SOS>": SOS_IDX, "<EOS>": EOS_IDX, "<UNK>": UNK_IDX}
+    for word, _ in counter.most_common(max_size - 4):
+        vocab[word] = len(vocab)
+    return vocab
+
+print("Construyendo vocabularios...")
+src_vocab = build_vocab(src_sentences, src_vocab_size)
+tgt_vocab = build_vocab(tgt_sentences, tgt_vocab_size)
+print(f"Vocabulario español: {len(src_vocab)} palabras")
+print(f"Vocabulario inglés:  {len(tgt_vocab)} palabras")
+
+# --- CODIFICAR FRASES ---
+# Convierte una frase de texto a una lista de índices enteros, con padding.
 #
-# IMPORTANTE: como los datos son aleatorios, no hay ningún patrón real que aprender.
-# El objetivo es solo verificar que el código funciona sin errores de dimensiones.
-#
-# .to(device): los datos también deben estar en el mismo device que el modelo.
-# Si el modelo está en GPU y los datos en CPU, PyTorch lanza un error.
-src_data = torch.randint(1, src_vocab_size, (64, max_seq_length)).to(device)  # [batch=64, seq_len=100]
-tgt_data = torch.randint(1, tgt_vocab_size, (64, max_seq_length)).to(device)  # [batch=64, seq_len=100]
+# Ejemplo humano:
+#   "El gato duerme" con max_len=6
+#   -> tokenizar:  ["el", "gato", "duerme"]
+#   -> añadir SOS/EOS: [<SOS>, "el", "gato", "duerme", <EOS>]
+#   -> convertir a IDs: [1, 47, 83, 291, 2]
+#   -> padding hasta max_len: [1, 47, 83, 291, 2, 0]
+def encode(sentence, vocab, max_len):
+    tokens = sentence.lower().split()
+    # Añadir SOS al inicio y EOS al final
+    ids = [SOS_IDX] + [vocab.get(t, UNK_IDX) for t in tokens] + [EOS_IDX]
+    # Truncar si la frase es más larga que max_len
+    ids = ids[:max_len]
+    # Rellenar con PAD si la frase es más corta que max_len
+    ids += [PAD_IDX] * (max_len - len(ids))
+    return torch.tensor(ids, dtype=torch.long)
+
+# --- CLASE DATASET ---
+# PyTorch necesita que los datos estén envueltos en una clase Dataset.
+# Esta clase implementa __len__ y __getitem__ para que DataLoader pueda
+# iterar sobre ella y crear batches automáticamente.
+class TranslationDataset(Dataset):
+    def __init__(self, src_sentences, tgt_sentences, src_vocab, tgt_vocab, max_len):
+        print("Codificando frases (esto puede tardar unos segundos)...")
+        # Pre-codificar todas las frases al instanciar el dataset
+        # para no tener que hacerlo en cada iteración del entrenamiento
+        self.src = [encode(s, src_vocab, max_len) for s in src_sentences]
+        self.tgt = [encode(s, tgt_vocab, max_len) for s in tgt_sentences]
+
+    def __len__(self):
+        # Cuántos pares de frases tiene el dataset
+        return len(self.src)
+
+    def __getitem__(self, idx):
+        # Devuelve el par (frase española, frase inglesa) en el índice idx
+        return self.src[idx], self.tgt[idx]
+
+# Crear el dataset y el DataLoader.
+# DataLoader divide el dataset en batches y los baraja en cada época.
+#   batch_size=32: 32 pares de frases por paso de entrenamiento
+#   shuffle=True: barajar el dataset en cada época para evitar que el modelo
+#                 aprenda el orden de los datos
+translation_dataset = TranslationDataset(src_sentences, tgt_sentences, src_vocab, tgt_vocab, max_seq_length)
+dataloader = DataLoader(translation_dataset, batch_size=32, shuffle=True)
+print(f"Dataset listo: {len(translation_dataset)} pares | {len(dataloader)} batches por época")
 
 # =============================================================================
 # PASO 6: ENTRENAR EL MODELO
@@ -548,53 +631,56 @@ optimizer = optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), e
 # (En modo evaluación/inferencia se usa transformer.eval(), que las desactiva)
 transformer.train()
 
-# Bucle de entrenamiento: 100 épocas (una época = ver todos los datos una vez)
-for epoch in range(100):
-    # Paso 1: Limpiar los gradientes del paso anterior.
-    # Los gradientes se ACUMULAN en PyTorch por defecto, hay que resetearlos.
-    optimizer.zero_grad()
+# Bucle de entrenamiento: 10 épocas
+# Con datos reales, una época = ver los ~130k pares de frases una vez completa.
+# Cada época tiene ~4000 batches de 32 frases cada uno.
+for epoch in range(10):
+    transformer.train()
+    epoch_loss = 0  # Acumular el loss de todos los batches para hacer la media
 
-    # Paso 2: Forward pass con TEACHER FORCING.
-    #
-    # Ejemplo humano: imagina que la frase objetivo es [START, "hello", "world", END]
-    # En tokens: [7, 23, 47, 3]
-    #
-    # El decoder predice token por token. En cada posición, le damos como contexto
-    # todos los tokens CORRECTOS anteriores (no los que él mismo predijo).
-    # Esto se llama "teacher forcing": el profesor (teacher) te da la respuesta
-    # correcta como contexto, aunque hayas fallado antes.
-    #
-    # tgt_data[:, :-1] = todo excepto el último token  -> ENTRADA al decoder
-    #   [START, "hello", "world"]  (el decoder ve esto para predecir lo siguiente)
-    #
-    # tgt_data[:, 1:]  = todo excepto el primer token  -> RESPUESTA ESPERADA
-    #   ["hello", "world", END]    (lo que el decoder debería haber predicho)
-    #
-    # Resultado: output tiene forma [64, 99, 5000]
-    #   64 frases, 99 posiciones, 5000 probabilidades (una por palabra del vocabulario)
-    output = transformer(src_data, tgt_data[:, :-1])
+    for batch_idx, (src_batch, tgt_batch) in enumerate(dataloader):
 
-    # Paso 3: Calcular el error (loss).
-    #
-    # CrossEntropyLoss necesita:
-    #   - predicciones: [N, num_clases]  -> [6336, 5000]
-    #   - targets:      [N]              -> [6336]
-    # donde N = batch * seq_len = 64 * 99 = 6336
-    #
-    # .contiguous() garantiza que el tensor esté en memoria contigua (necesario para .view)
-    # .view(-1, tgt_vocab_size) aplana [64, 99, 5000] -> [6336, 5000]
-    # .view(-1)                 aplana [64, 99]        -> [6336]
-    #
-    # Es como juntar todas las predicciones de todas las frases en una lista larga.
-    loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+        # Mover el batch a la GPU (los datos salen del DataLoader en CPU por defecto)
+        src_batch = src_batch.to(device)  # [batch=32, seq_len=100]
+        tgt_batch = tgt_batch.to(device)  # [batch=32, seq_len=100]
 
-    # Paso 4: Backward pass.
-    # Calcula los gradientes: "¿cuánto contribuyó cada peso al error?"
-    # PyTorch lo hace automáticamente con autograd (diferenciación automática).
-    loss.backward()
+        # Paso 1: Limpiar los gradientes del paso anterior.
+        # Los gradientes se ACUMULAN en PyTorch por defecto, hay que resetearlos.
+        optimizer.zero_grad()
 
-    # Paso 5: Actualizar los pesos del modelo usando los gradientes calculados.
-    # Adam ajusta cada peso en la dirección que reduce el error.
-    optimizer.step()
+        # Paso 2: Forward pass con TEACHER FORCING.
+        #
+        # Ejemplo humano: la frase objetivo es [<SOS>, "the", "cat", "sleeps", <EOS>, <PAD>, <PAD>]
+        #
+        # tgt_batch[:, :-1] = entrada al decoder (todo excepto el último token):
+        #   [<SOS>, "the", "cat", "sleeps", <EOS>, <PAD>]
+        #   "dado este contexto, predice el siguiente token"
+        #
+        # tgt_batch[:, 1:]  = respuesta esperada (todo excepto el primero):
+        #   ["the", "cat", "sleeps", <EOS>, <PAD>, <PAD>]
+        #   "esto es lo que deberías haber predicho"
+        output = transformer(src_batch, tgt_batch[:, :-1])
 
-    print(f"Epoch: {epoch+1}, Loss: {loss.item()}")
+        # Paso 3: Calcular el error (loss).
+        # Aplanar para que CrossEntropyLoss pueda comparar:
+        #   output: [32, 99, 5000] -> [3168, 5000]
+        #   target: [32, 99]       -> [3168]
+        # Los tokens PAD (índice 0) se ignoran gracias a ignore_index=0
+        loss = criterion(
+            output.contiguous().view(-1, tgt_vocab_size),
+            tgt_batch[:, 1:].contiguous().view(-1)
+        )
+
+        # Paso 4: Backward pass + actualizar pesos
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+
+        # Mostrar progreso cada 100 batches para no saturar la terminal
+        if (batch_idx + 1) % 100 == 0:
+            print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f}")
+
+    # Al final de cada época, mostrar el loss medio de toda la época
+    avg_loss = epoch_loss / len(dataloader)
+    print(f"Epoch {epoch+1} completada | Loss medio: {avg_loss:.4f}")
