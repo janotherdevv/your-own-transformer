@@ -1,5 +1,5 @@
 # Transformer ES→EN desde cero
-
+s
 Implementación de un modelo Transformer para traducción español→inglés, construido desde cero con PyTorch siguiendo el paper original ["Attention is All You Need"](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017).
 
 **Proyecto de aprendizaje** basado en la guía [Build your own Transformer from scratch using Pytorch](https://medium.com/data-science/build-your-own-transformer-from-scratch-using-pytorch-84850470dcb) de Arjun Sarkar.
