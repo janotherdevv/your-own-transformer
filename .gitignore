@@ -1,1 +1,4 @@
 .github
+__pycache__
+transformer_model.pt
+*json
