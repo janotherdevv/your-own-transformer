@@ -428,7 +428,10 @@ class Transformer(nn.Module):
         # nopeak_mask: evita que el modelo vea el futuro (máscara causal)
         # Crea una matriz triangular superior con 0s
         seq_length = tgt.size(1)
-        nopeak_mask = (1 - torch.triu(torch.ones(1, seq_length, seq_length), diagonal=1)).bool()
+        # .to(tgt.device): nopeak_mask se crea siempre en CPU por defecto.
+        # Si el modelo está en GPU, tgt_mask ya está en GPU y el & fallaría con
+        # "Expected all tensors to be on the same device". Hay que moverlo explícitamente.
+        nopeak_mask = (1 - torch.triu(torch.ones(1, seq_length, seq_length), diagonal=1)).bool().to(tgt.device)
         
         # Combina: padding mask AND causal mask
         tgt_mask = tgt_mask & nopeak_mask
@@ -478,3 +481,120 @@ class Transformer(nn.Module):
         output = self.fc(dec_output)
         return output
 
+# =============================================================================
+# PASO 5: PREPARAR DATOS DE EJEMPLO
+# =============================================================================
+# Hiperparámetros del modelo: definen la arquitectura y capacidad
+## NOTA: Los valores del paper original están diseñados para GPU.
+## En CPU petan la RAM (~2.5GB en pico). Aquí usamos GPU si está disponible.
+##
+## Comparativa de memoria:
+##   GPU (VRAM, este):  batch=64, seq=100, d=512, layers=6  → ~2.5GB VRAM  ✓ cabe en RTX 3060
+##   CPU (RAM):         batch=64, seq=100, d=512, layers=6  → ~2.5GB RAM   ✗ puede congelar el PC
+
+# Detectar si hay GPU disponible y usarla automáticamente.
+# device = "cuda" si hay GPU con CUDA, "cpu" si no hay.
+# Todo lo que vaya a la GPU (modelo, datos) debe estar en el mismo device.
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Usando device: {device}")
+
+src_vocab_size = 5000   # Tamaño del vocabulario español: 5000 palabras distintas conocidas
+tgt_vocab_size = 5000   # Tamaño del vocabulario inglés: 5000 palabras distintas conocidas
+d_model = 512           # Cada palabra se representa como un vector de 512 números
+num_heads = 8           # La atención se divide en 8 "cabezas" paralelas
+num_layers = 6          # El Encoder y el Decoder tienen 6 capas cada uno
+d_ff = 2048             # La red feed-forward interna usa vectores de 2048 (4x d_model)
+max_seq_length = 100    # Las frases pueden tener como máximo 100 tokens
+dropout = 0.1           # Durante el entrenamiento, se apagan aleatoriamente el 10% de neuronas
+
+# Instanciar el modelo y moverlo al device (GPU o CPU).
+# .to(device) copia todos los pesos del modelo a la memoria del device elegido.
+transformer = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout).to(device)
+
+# --- DATOS DE JUGUETE (toy dataset) ---
+# En la vida real tendrías pares de frases reales:
+#   "El gato duerme"  ->  diccionario español  ->  [42, 187, 63]
+#   "The cat sleeps"  ->  diccionario inglés   ->  [15, 93, 201]
+#
+# Aquí simulamos eso con números aleatorios entre 1 y 4999.
+# El 0 está excluido porque está RESERVADO para padding (relleno de frases cortas).
+# Forma resultante: (64 frases, 100 tokens por frase)
+#
+# IMPORTANTE: como los datos son aleatorios, no hay ningún patrón real que aprender.
+# El objetivo es solo verificar que el código funciona sin errores de dimensiones.
+#
+# .to(device): los datos también deben estar en el mismo device que el modelo.
+# Si el modelo está en GPU y los datos en CPU, PyTorch lanza un error.
+src_data = torch.randint(1, src_vocab_size, (64, max_seq_length)).to(device)  # [batch=64, seq_len=100]
+tgt_data = torch.randint(1, tgt_vocab_size, (64, max_seq_length)).to(device)  # [batch=64, seq_len=100]
+
+# =============================================================================
+# PASO 6: ENTRENAR EL MODELO
+# =============================================================================
+
+# CrossEntropyLoss: función de pérdida para clasificación multiclase.
+# En cada posición, el modelo predice una distribución sobre 5000 palabras.
+# ignore_index=0: ignora el token de padding al calcular el error,
+# porque el padding no es una palabra real y no debería penalizarse.
+criterion = nn.CrossEntropyLoss(ignore_index=0)
+
+# Optimizador Adam con los hiperparámetros del paper original "Attention is All You Need":
+#   lr=0.0001:        tasa de aprendizaje (cuánto se ajustan los pesos en cada paso)
+#   betas=(0.9, 0.98): coeficientes para las medias móviles de gradientes (momentum)
+#   eps=1e-9:         término de estabilidad numérica para evitar división por cero
+optimizer = optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
+
+# Poner el modelo en modo entrenamiento: activa dropout y otras capas de regularización.
+# (En modo evaluación/inferencia se usa transformer.eval(), que las desactiva)
+transformer.train()
+
+# Bucle de entrenamiento: 100 épocas (una época = ver todos los datos una vez)
+for epoch in range(100):
+    # Paso 1: Limpiar los gradientes del paso anterior.
+    # Los gradientes se ACUMULAN en PyTorch por defecto, hay que resetearlos.
+    optimizer.zero_grad()
+
+    # Paso 2: Forward pass con TEACHER FORCING.
+    #
+    # Ejemplo humano: imagina que la frase objetivo es [START, "hello", "world", END]
+    # En tokens: [7, 23, 47, 3]
+    #
+    # El decoder predice token por token. En cada posición, le damos como contexto
+    # todos los tokens CORRECTOS anteriores (no los que él mismo predijo).
+    # Esto se llama "teacher forcing": el profesor (teacher) te da la respuesta
+    # correcta como contexto, aunque hayas fallado antes.
+    #
+    # tgt_data[:, :-1] = todo excepto el último token  -> ENTRADA al decoder
+    #   [START, "hello", "world"]  (el decoder ve esto para predecir lo siguiente)
+    #
+    # tgt_data[:, 1:]  = todo excepto el primer token  -> RESPUESTA ESPERADA
+    #   ["hello", "world", END]    (lo que el decoder debería haber predicho)
+    #
+    # Resultado: output tiene forma [64, 99, 5000]
+    #   64 frases, 99 posiciones, 5000 probabilidades (una por palabra del vocabulario)
+    output = transformer(src_data, tgt_data[:, :-1])
+
+    # Paso 3: Calcular el error (loss).
+    #
+    # CrossEntropyLoss necesita:
+    #   - predicciones: [N, num_clases]  -> [6336, 5000]
+    #   - targets:      [N]              -> [6336]
+    # donde N = batch * seq_len = 64 * 99 = 6336
+    #
+    # .contiguous() garantiza que el tensor esté en memoria contigua (necesario para .view)
+    # .view(-1, tgt_vocab_size) aplana [64, 99, 5000] -> [6336, 5000]
+    # .view(-1)                 aplana [64, 99]        -> [6336]
+    #
+    # Es como juntar todas las predicciones de todas las frases en una lista larga.
+    loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+
+    # Paso 4: Backward pass.
+    # Calcula los gradientes: "¿cuánto contribuyó cada peso al error?"
+    # PyTorch lo hace automáticamente con autograd (diferenciación automática).
+    loss.backward()
+
+    # Paso 5: Actualizar los pesos del modelo usando los gradientes calculados.
+    # Adam ajusta cada peso en la dirección que reduce el error.
+    optimizer.step()
+
+    print(f"Epoch: {epoch+1}, Loss: {loss.item()}")
