@@ -1,62 +1,161 @@
-Qué hace el script                                                                                                                                                                                        
-                                                                                                                                                                                                            
-  Imagina que tienes un niño que no sabe inglés y quieres enseñarle a traducir del español al inglés.                                                                                                       
-                  
-  Lo que hace el script es exactamente eso, pero con una red neuronal:                                                                                                                                      
-                  
-  ---
-  1. Prepara el "cerebro" (la arquitectura Transformer)
+# Transformer ES→EN desde cero
 
-  Crea una red neuronal con millones de parámetros (números ajustables). Al principio todos son aleatorios, el modelo no sabe nada. Es como un niño recién nacido.
+Implementación de un modelo Transformer para traducción español→inglés, construido desde cero con PyTorch siguiendo el paper original ["Attention is All You Need"](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017).
 
-  ---
-  2. Le da un diccionario (los vocabularios)
+Proyecto de aprendizaje basado en la guía [Build your own Transformer from scratch using Pytorch](https://medium.com/data-science/build-your-own-transformer-from-scratch-using-pytorch-84850470dcb) de Arjun Sarkar.
 
-  Le dice: "estas son las 5000 palabras en español que vas a ver, y estas son las 5000 en inglés que puedes escribir". Cada palabra tiene un número asignado.
+---
 
-  ---
-  3. Lo entrena (el bucle de épocas)
+## Qué hace este proyecto
 
-  Le muestra 130.000 pares de frases reales de libros:
-  - "El gato duerme" → "The cat sleeps"
-  - "Buenos días" → "Good morning"
-  - ... 130.000 veces más
+Entrena un Transformer que aprende a traducir frases del español al inglés usando ~93.000 pares de frases reales de libros literarios (dataset `opus_books`). Una vez entrenado, el modelo se guarda en disco y puede usarse para traducir sin necesidad de reentrenar.
 
-  En cada par hace esto:
-  1. Le da la frase en español
-  2. Le dice "intenta traducirla"
-  3. Compara lo que dijo con la traducción correcta
-  4. Calcula el error (loss)
-  5. Ajusta los millones de parámetros un poquito para que la próxima vez falle menos
-  6. Repite
+---
 
-  Después de ver todos los pares miles de veces, los parámetros se van ajustando solos hasta que el modelo aprende los patrones del idioma.
+## Arquitectura
 
-  ---
-  El loss bajando = está aprendiendo
+El modelo implementa la arquitectura Transformer completa tal como se describe en el paper original:
 
-  Época 1:  Loss 8.5  → "no tengo ni idea, adivino aleatoriamente"
-  Época 5:  Loss 5.2  → "algo he captado"
-  Época 10: Loss 3.1  → "entiendo bastantes patrones"
+```
+Entrada (español)
+      ↓
+ Embedding + Positional Encoding
+      ↓
+ Encoder (6 capas)
+   └─ Multi-Head Self-Attention (8 heads)
+   └─ Feed-Forward Network (d_ff=2048)
+   └─ Add & Norm (residual connections)
+      ↓
+ Decoder (6 capas)
+   └─ Masked Multi-Head Self-Attention
+   └─ Cross-Attention (mira al Encoder)
+   └─ Feed-Forward Network
+   └─ Add & Norm
+      ↓
+ Capa lineal + Softmax
+      ↓
+Salida (inglés)
+```
 
-  ---
-  Qué podemos hacer con él
+### Hiperparámetros
 
-  Una vez entrenado, hay tres cosas interesantes:
+| Parámetro | Valor | Descripción |
+|-----------|-------|-------------|
+| `d_model` | 512 | Dimensión de los embeddings |
+| `num_heads` | 8 | Cabezas de atención paralelas |
+| `num_layers` | 6 | Capas en encoder y decoder |
+| `d_ff` | 2048 | Dimensión interna de la FFN |
+| `max_seq_length` | 100 | Longitud máxima de secuencia |
+| `src_vocab_size` | 5000 | Palabras en vocabulario español |
+| `tgt_vocab_size` | 5000 | Palabras en vocabulario inglés |
+| `dropout` | 0.1 | Tasa de dropout |
+| `batch_size` | 32 | Frases por paso de entrenamiento |
+| `epochs` | 10 | Épocas de entrenamiento |
 
-  1. Traducir frases nuevas
-  Darle una frase en español que nunca ha visto y que genere la traducción en inglés token por token.
+---
 
-  2. Ver qué ha aprendido (visualizar la atención)
-  El Transformer tiene matrices de atención que puedes visualizar como un mapa de calor. Te muestra qué palabra española estaba "mirando" el modelo cuando generó cada palabra inglesa. Es fascinante ver
-  cómo conecta "gato" con "cat".
+## Requisitos
 
-  3. Guardarlo y cargarlo
-  Guardar los pesos entrenados en un archivo para no tener que reentrenar cada vez.
+```bash
+pip install torch datasets
+```
 
-  ---
-  Lo que NO puede hacer (limitaciones de este modelo)
+- Python 3.10+
+- PyTorch (con soporte CUDA recomendado)
+- GPU con ~3GB de VRAM (probado en RTX 3060 12GB)
 
-  - Con solo 5000 palabras en el vocabulario, muchas palabras aparecerán como <UNK> (desconocida)
-  - Con 10 épocas de entrenamiento, las traducciones serán mediocres pero reconocibles
-  - No tiene mecanismo de búsqueda (beam search), solo escoge la palabra más probable en cada paso
+> **Sin GPU:** el modelo es demasiado grande para entrenarse en CPU sin congelar el sistema. Si no tienes GPU, reduce `d_model=128`, `num_layers=2`, `d_ff=256` y `batch_size=8`.
+
+---
+
+## Uso
+
+### Primera ejecución (entrenamiento)
+
+```bash
+python3 translator-es-en-transformer.py
+```
+
+El script:
+1. Descarga el dataset `opus_books` (~93k pares de frases)
+2. Construye los vocabularios español e inglés
+3. Entrena el modelo durante 10 épocas (~1 hora en RTX 3060)
+4. Guarda el modelo y vocabularios en disco
+5. Lanza el modo interactivo para traducir
+
+### Ejecuciones siguientes (sin reentrenar)
+
+El script detecta automáticamente los archivos guardados y los carga directamente, saltándose el entrenamiento.
+
+### Archivos generados
+
+| Archivo | Tamaño aprox. | Contenido |
+|---------|---------------|-----------|
+| `transformer_model.pt` | ~200MB | Pesos del modelo entrenado |
+| `src_vocab.json` | ~80KB | Diccionario español → índice |
+| `tgt_vocab.json` | ~80KB | Diccionario inglés → índice |
+
+---
+
+## Modo interactivo
+
+Al terminar el entrenamiento (o al cargar un modelo ya entrenado), el script muestra ejemplos automáticos y abre un modo interactivo:
+
+```
+ES > el gato duerme en la cama
+EN > the cat sleeps on the bed
+
+ES > buenos días
+EN > good morning
+
+ES > salir
+```
+
+Escribe `salir` para terminar.
+
+---
+
+## Estructura del código
+
+```
+translator-es-en-transformer.py
+│
+├── MultiHeadAttention       # Mecanismo de atención multi-cabeza
+├── PositionWiseFeedForward  # Red feed-forward posición a posición
+├── PositionalEncoding       # Codificación posicional con senos/cosenos
+├── EncoderLayer             # Una capa del encoder
+├── DecoderLayer             # Una capa del decoder
+├── Transformer              # Modelo completo (encoder + decoder)
+│
+├── PASO 5: Preparar datos
+│   ├── Carga opus_books
+│   ├── Construye vocabularios
+│   ├── TranslationDataset
+│   └── DataLoader
+│
+├── PASO 6: Entrenar o cargar
+│   ├── Si existe transformer_model.pt → carga
+│   └── Si no existe → entrena y guarda
+│
+└── PASO 7: Traducir
+    ├── translate()          # Greedy decoding
+    ├── Ejemplos automáticos
+    └── Modo interactivo
+```
+
+---
+
+## Limitaciones
+
+- **Vocabulario pequeño (5000 palabras):** palabras poco frecuentes se traducen como `<UNK>`. En producción se usaría BPE o WordPiece con vocabularios de 30k-50k tokens.
+- **Greedy decoding:** en cada paso escoge el token más probable. Beam search produciría mejores traducciones.
+- **Sin puntuación:** el tokenizador es simple (split por espacios), la puntuación pegada a las palabras puede no reconocerse.
+- **Dominio literario:** el modelo ha aprendido de libros, funciona mejor con frases de ese estilo.
+
+---
+
+## Referencias
+
+- Vaswani et al. (2017) — [Attention is All You Need](https://arxiv.org/abs/1706.03762)
+- Arjun Sarkar — [Build your own Transformer from scratch using Pytorch](https://medium.com/data-science/build-your-own-transformer-from-scratch-using-pytorch-84850470dcb)
+- Dataset: [opus_books en-es](https://huggingface.co/datasets/Helsinki-NLP/opus_books) via HuggingFace

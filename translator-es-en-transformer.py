@@ -6,6 +6,8 @@ import math  # Funciones matemáticas: sqrt, log, etc.
 import copy  # Copias profundas de objetos
 from datasets import load_dataset  # HuggingFace datasets: carga datasets públicos en una línea
 from collections import Counter  # Cuenta frecuencias de palabras para construir el vocabulario
+import os    # Para comprobar si existe el archivo del modelo guardado
+import json  # Para guardar/cargar los vocabularios en formato legible
 
 class MultiHeadAttention(nn.Module):
     """
@@ -529,15 +531,15 @@ UNK_IDX = 3
 # opus_books: traducciones de libros literarios español <-> inglés
 # ~130k pares de frases, texto real de alta calidad.
 # HuggingFace lo descarga y cachea automáticamente en ~/.cache/huggingface/
-print("Cargando dataset opus_books es-en...")
-dataset = load_dataset("opus_books", "es-en")
+print("Cargando dataset opus_books es-en...", flush=True)
+dataset = load_dataset("opus_books", "en-es")
 train_data = dataset["train"]
 
 # Extraer las frases en cada idioma del dataset.
 # La estructura de opus_books es: train_data["translation"] = [{"es": "...", "en": "..."}, ...]
 src_sentences = [item["es"] for item in train_data["translation"]]
 tgt_sentences = [item["en"] for item in train_data["translation"]]
-print(f"Frases cargadas: {len(src_sentences)}")
+print(f"Frases cargadas: {len(src_sentences)}", flush=True)
 
 # --- CONSTRUIR VOCABULARIOS ---
 # Un vocabulario es un diccionario palabra -> índice.
@@ -557,11 +559,12 @@ def build_vocab(sentences, max_size):
         vocab[word] = len(vocab)
     return vocab
 
-print("Construyendo vocabularios...")
+print("Construyendo vocabulario español...", flush=True)
 src_vocab = build_vocab(src_sentences, src_vocab_size)
+print(f"Vocabulario español listo: {len(src_vocab)} palabras", flush=True)
+print("Construyendo vocabulario inglés...", flush=True)
 tgt_vocab = build_vocab(tgt_sentences, tgt_vocab_size)
-print(f"Vocabulario español: {len(src_vocab)} palabras")
-print(f"Vocabulario inglés:  {len(tgt_vocab)} palabras")
+print(f"Vocabulario inglés listo:  {len(tgt_vocab)} palabras", flush=True)
 
 # --- CODIFICAR FRASES ---
 # Convierte una frase de texto a una lista de índices enteros, con padding.
@@ -588,11 +591,20 @@ def encode(sentence, vocab, max_len):
 # iterar sobre ella y crear batches automáticamente.
 class TranslationDataset(Dataset):
     def __init__(self, src_sentences, tgt_sentences, src_vocab, tgt_vocab, max_len):
-        print("Codificando frases (esto puede tardar unos segundos)...")
-        # Pre-codificar todas las frases al instanciar el dataset
-        # para no tener que hacerlo en cada iteración del entrenamiento
-        self.src = [encode(s, src_vocab, max_len) for s in src_sentences]
-        self.tgt = [encode(s, tgt_vocab, max_len) for s in tgt_sentences]
+        total = len(src_sentences)
+        print(f"Codificando {total} frases españolas...", flush=True)
+        self.src = []
+        for i, s in enumerate(src_sentences):
+            self.src.append(encode(s, src_vocab, max_len))
+            if (i + 1) % 10000 == 0:
+                print(f"  ES: {i+1}/{total} frases codificadas", flush=True)
+
+        print(f"Codificando {total} frases inglesas...", flush=True)
+        self.tgt = []
+        for i, s in enumerate(tgt_sentences):
+            self.tgt.append(encode(s, tgt_vocab, max_len))
+            if (i + 1) % 10000 == 0:
+                print(f"  EN: {i+1}/{total} frases codificadas", flush=True)
 
     def __len__(self):
         # Cuántos pares de frases tiene el dataset
@@ -609,11 +621,17 @@ class TranslationDataset(Dataset):
 #                 aprenda el orden de los datos
 translation_dataset = TranslationDataset(src_sentences, tgt_sentences, src_vocab, tgt_vocab, max_seq_length)
 dataloader = DataLoader(translation_dataset, batch_size=32, shuffle=True)
-print(f"Dataset listo: {len(translation_dataset)} pares | {len(dataloader)} batches por época")
+print(f"Dataset listo: {len(translation_dataset)} pares | {len(dataloader)} batches por época", flush=True)
 
 # =============================================================================
-# PASO 6: ENTRENAR EL MODELO
+# PASO 6: ENTRENAR EL MODELO (o cargar uno ya entrenado)
 # =============================================================================
+
+# Rutas de los archivos donde se guarda el modelo y los vocabularios.
+# Se guardan en la misma carpeta que el script.
+MODEL_PATH = "transformer_model.pt"    # Pesos del modelo (los millones de parámetros)
+SRC_VOCAB_PATH = "src_vocab.json"      # Diccionario español -> índice
+TGT_VOCAB_PATH = "tgt_vocab.json"      # Diccionario inglés  -> índice
 
 # CrossEntropyLoss: función de pérdida para clasificación multiclase.
 # En cada posición, el modelo predice una distribución sobre 5000 palabras.
@@ -627,60 +645,204 @@ criterion = nn.CrossEntropyLoss(ignore_index=0)
 #   eps=1e-9:         término de estabilidad numérica para evitar división por cero
 optimizer = optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
 
-# Poner el modelo en modo entrenamiento: activa dropout y otras capas de regularización.
-# (En modo evaluación/inferencia se usa transformer.eval(), que las desactiva)
-transformer.train()
+# --- COMPROBAR SI YA EXISTE UN MODELO GUARDADO ---
+# Si los tres archivos existen, cargamos el modelo y los vocabularios directamente
+# y nos saltamos todo el entrenamiento. Si no, entrenamos desde cero.
+#
+# Ejemplo humano: es como un estudiante que ya ha pasado el examen.
+# Si tiene el título guardado en casa, no necesita volver a estudiar.
+# Solo saca el título y listo.
+if os.path.exists(MODEL_PATH) and os.path.exists(SRC_VOCAB_PATH) and os.path.exists(TGT_VOCAB_PATH):
+    print(f"Modelo encontrado en '{MODEL_PATH}'. Cargando pesos...", flush=True)
 
-# Bucle de entrenamiento: 10 épocas
-# Con datos reales, una época = ver los ~130k pares de frases una vez completa.
-# Cada época tiene ~4000 batches de 32 frases cada uno.
-for epoch in range(10):
+    # Cargar los vocabularios desde JSON
+    with open(SRC_VOCAB_PATH, "r") as f:
+        src_vocab = json.load(f)
+    with open(TGT_VOCAB_PATH, "r") as f:
+        tgt_vocab = json.load(f)
+
+    # torch.load lee el archivo .pt y devuelve el diccionario de pesos.
+    # map_location=device: si el modelo se guardó en GPU pero ahora solo hay CPU
+    # (o viceversa), PyTorch lo recoloca automáticamente en el device correcto.
+    transformer.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+
+    print("Modelo cargado correctamente. Listo para traducir sin reentrenar.", flush=True)
+
+else:
+    print("No se encontró modelo guardado. Iniciando entrenamiento desde cero...", flush=True)
+
+    # Poner el modelo en modo entrenamiento: activa dropout y otras capas de regularización.
+    # (En modo evaluación/inferencia se usa transformer.eval(), que las desactiva)
     transformer.train()
-    epoch_loss = 0  # Acumular el loss de todos los batches para hacer la media
 
-    for batch_idx, (src_batch, tgt_batch) in enumerate(dataloader):
+    # Bucle de entrenamiento: 10 épocas
+    # Con datos reales, una época = ver los ~130k pares de frases una vez completa.
+    # Cada época tiene ~4000 batches de 32 frases cada uno.
+    for epoch in range(10):
+        transformer.train()
+        epoch_loss = 0  # Acumular el loss de todos los batches para hacer la media
 
-        # Mover el batch a la GPU (los datos salen del DataLoader en CPU por defecto)
-        src_batch = src_batch.to(device)  # [batch=32, seq_len=100]
-        tgt_batch = tgt_batch.to(device)  # [batch=32, seq_len=100]
+        for batch_idx, (src_batch, tgt_batch) in enumerate(dataloader):
 
-        # Paso 1: Limpiar los gradientes del paso anterior.
-        # Los gradientes se ACUMULAN en PyTorch por defecto, hay que resetearlos.
-        optimizer.zero_grad()
+            # Mover el batch a la GPU (los datos salen del DataLoader en CPU por defecto)
+            src_batch = src_batch.to(device)  # [batch=32, seq_len=100]
+            tgt_batch = tgt_batch.to(device)  # [batch=32, seq_len=100]
 
-        # Paso 2: Forward pass con TEACHER FORCING.
-        #
-        # Ejemplo humano: la frase objetivo es [<SOS>, "the", "cat", "sleeps", <EOS>, <PAD>, <PAD>]
-        #
-        # tgt_batch[:, :-1] = entrada al decoder (todo excepto el último token):
-        #   [<SOS>, "the", "cat", "sleeps", <EOS>, <PAD>]
-        #   "dado este contexto, predice el siguiente token"
-        #
-        # tgt_batch[:, 1:]  = respuesta esperada (todo excepto el primero):
-        #   ["the", "cat", "sleeps", <EOS>, <PAD>, <PAD>]
-        #   "esto es lo que deberías haber predicho"
-        output = transformer(src_batch, tgt_batch[:, :-1])
+            # Paso 1: Limpiar los gradientes del paso anterior.
+            # Los gradientes se ACUMULAN en PyTorch por defecto, hay que resetearlos.
+            optimizer.zero_grad()
 
-        # Paso 3: Calcular el error (loss).
-        # Aplanar para que CrossEntropyLoss pueda comparar:
-        #   output: [32, 99, 5000] -> [3168, 5000]
-        #   target: [32, 99]       -> [3168]
-        # Los tokens PAD (índice 0) se ignoran gracias a ignore_index=0
-        loss = criterion(
-            output.contiguous().view(-1, tgt_vocab_size),
-            tgt_batch[:, 1:].contiguous().view(-1)
-        )
+            # Paso 2: Forward pass con TEACHER FORCING.
+            #
+            # Ejemplo humano: la frase objetivo es [<SOS>, "the", "cat", "sleeps", <EOS>, <PAD>, <PAD>]
+            #
+            # tgt_batch[:, :-1] = entrada al decoder (todo excepto el último token):
+            #   [<SOS>, "the", "cat", "sleeps", <EOS>, <PAD>]
+            #   "dado este contexto, predice el siguiente token"
+            #
+            # tgt_batch[:, 1:]  = respuesta esperada (todo excepto el primero):
+            #   ["the", "cat", "sleeps", <EOS>, <PAD>, <PAD>]
+            #   "esto es lo que deberías haber predicho"
+            output = transformer(src_batch, tgt_batch[:, :-1])
 
-        # Paso 4: Backward pass + actualizar pesos
-        loss.backward()
-        optimizer.step()
+            # Paso 3: Calcular el error (loss).
+            # Aplanar para que CrossEntropyLoss pueda comparar:
+            #   output: [32, 99, 5000] -> [3168, 5000]
+            #   target: [32, 99]       -> [3168]
+            # Los tokens PAD (índice 0) se ignoran gracias a ignore_index=0
+            loss = criterion(
+                output.contiguous().view(-1, tgt_vocab_size),
+                tgt_batch[:, 1:].contiguous().view(-1)
+            )
 
-        epoch_loss += loss.item()
+            # Paso 4: Backward pass + actualizar pesos
+            loss.backward()
+            optimizer.step()
 
-        # Mostrar progreso cada 100 batches para no saturar la terminal
-        if (batch_idx + 1) % 100 == 0:
-            print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f}")
+            epoch_loss += loss.item()
 
-    # Al final de cada época, mostrar el loss medio de toda la época
-    avg_loss = epoch_loss / len(dataloader)
-    print(f"Epoch {epoch+1} completada | Loss medio: {avg_loss:.4f}")
+            # Mostrar progreso cada 100 batches para no saturar la terminal
+            if (batch_idx + 1) % 100 == 0:
+                print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f}", flush=True)
+
+        # Al final de cada época, mostrar el loss medio de toda la época
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"Epoch {epoch+1} completada | Loss medio: {avg_loss:.4f}", flush=True)
+
+    # --- GUARDAR EL MODELO Y LOS VOCABULARIOS ---
+    # Se ejecuta UNA SOLA VEZ al terminar el entrenamiento.
+    #
+    # torch.save guarda el "state_dict": un diccionario con todos los pesos del modelo.
+    # No guarda la arquitectura (la clase Transformer), solo los números aprendidos.
+    # Por eso al cargar hay que crear primero el modelo vacío y luego meterle los pesos.
+    #
+    # Ejemplo humano: es como guardar solo las respuestas memorizadas del estudiante,
+    # no su cerebro completo. Para usarlas, necesitas un cerebro vacío (la clase)
+    # donde meterlas.
+    print(f"\nGuardando modelo en '{MODEL_PATH}'...", flush=True)
+    torch.save(transformer.state_dict(), MODEL_PATH)
+
+    # Guardar los vocabularios en JSON para poder leerlos en el futuro.
+    # Sin los vocabularios, los pesos del modelo son inútiles: no sabrías
+    # cómo convertir palabras a índices ni índices a palabras.
+    with open(SRC_VOCAB_PATH, "w") as f:
+        json.dump(src_vocab, f)
+    with open(TGT_VOCAB_PATH, "w") as f:
+        json.dump(tgt_vocab, f)
+
+    print(f"Vocabularios guardados en '{SRC_VOCAB_PATH}' y '{TGT_VOCAB_PATH}'.", flush=True)
+    print("La próxima vez que ejecutes el script, se cargará el modelo directamente.", flush=True)
+
+# =============================================================================
+# PASO 7: USAR EL MODELO PARA TRADUCIR
+# =============================================================================
+
+def translate(sentence):
+    """
+    Traduce una frase del español al inglés usando el modelo entrenado.
+
+    El proceso es el inverso al entrenamiento:
+      1. Convertir la frase española a una lista de índices (igual que en el entrenamiento)
+      2. Pasarla por el encoder para obtener la representación interna
+      3. El decoder genera la traducción TOKEN A TOKEN:
+           - Empieza con <SOS>
+           - En cada paso predice el token más probable y lo añade a la salida
+           - Para cuando genera <EOS> o llega a max_seq_length
+      4. Convertir los índices de vuelta a palabras usando el vocabulario inverso
+
+    Esto se llama GREEDY DECODING: en cada paso escoge el token con mayor
+    probabilidad. No es el mejor método (beam search es mejor) pero es el más simple.
+
+    Ejemplo humano: el modelo va construyendo la traducción palabra a palabra,
+    como si dictara en voz alta: "the... cat... sleeps... <fin>"
+    """
+    transformer.eval()  # Desactivar dropout para inferencia
+
+    # Construir vocabulario inverso: índice -> palabra
+    # Durante el entrenamiento usábamos palabra -> índice para codificar.
+    # Ahora necesitamos el sentido contrario para decodificar la salida del modelo.
+    # Ejemplo: {0: "<PAD>", 1: "<SOS>", 2: "<EOS>", 47: "cat", 83: "sleeps", ...}
+    idx_to_word = {idx: word for word, idx in tgt_vocab.items()}
+
+    # Paso 1: Codificar la frase española a tensor [1, max_seq_length]
+    # unsqueeze(0) añade la dimensión de batch: [max_seq_length] -> [1, max_seq_length]
+    src_tensor = encode(sentence, src_vocab, max_seq_length).unsqueeze(0).to(device)
+
+    # Paso 2: Generar la traducción token a token
+    # Empezamos con solo el token <SOS> en la salida del decoder
+    generated_tokens = [SOS_IDX]
+
+    with torch.no_grad():  # No necesitamos gradientes en inferencia, ahorra memoria
+        for _ in range(max_seq_length):
+
+            # Construir tensor con los tokens generados hasta ahora
+            tgt_tensor = torch.tensor(generated_tokens).unsqueeze(0).to(device)
+
+            # Forward pass: el modelo predice el siguiente token para cada posición
+            # output shape: [1, len(generated_tokens), tgt_vocab_size]
+            output = transformer(src_tensor, tgt_tensor)
+
+            # Greedy decoding: coger el token con mayor probabilidad en la ÚLTIMA posición
+            # output[0, -1, :] = distribución sobre el vocabulario para el siguiente token
+            # .argmax() = índice del token más probable
+            next_token = output[0, -1, :].argmax().item()
+            generated_tokens.append(next_token)
+
+            # Parar si el modelo generó el token de fin de secuencia
+            if next_token == EOS_IDX:
+                break
+
+    # Paso 3: Convertir los índices a palabras
+    # Saltar <SOS> (primer token) y <EOS> (último token si existe)
+    words = [
+        idx_to_word.get(idx, "<UNK>")
+        for idx in generated_tokens[1:]  # saltar <SOS>
+        if idx not in (EOS_IDX, PAD_IDX)  # saltar <EOS> y <PAD>
+    ]
+    return " ".join(words)
+
+
+# --- EJEMPLOS DE TRADUCCIÓN ---
+print("\n--- Probando el modelo ---", flush=True)
+test_sentences = [
+    "el gato duerme en la cama",
+    "buenos días, ¿cómo estás?",
+    "me gusta el café por la mañana",
+    "el libro está sobre la mesa",
+    "hoy hace mucho calor",
+]
+for sentence in test_sentences:
+    translation = translate(sentence)
+    print(f"ES: {sentence}", flush=True)
+    print(f"EN: {translation}", flush=True)
+    print(flush=True)
+
+# --- MODO INTERACTIVO ---
+# Permite escribir frases y traducirlas en tiempo real
+print("--- Modo interactivo (escribe 'salir' para terminar) ---", flush=True)
+while True:
+    sentence = input("ES > ").strip()
+    if sentence.lower() == "salir":
+        break
+    if sentence:
+        print(f"EN > {translate(sentence)}\n")
