@@ -73,19 +73,21 @@ pip install torch datasets
 ### Primera ejecución (entrenamiento)
 
 ```bash
-python3 translator-es-en-transformer.py
+python3 main.py
 ```
 
 El script:
-1. Descarga el dataset `opus_books` (~93k pares de frases)
-2. Construye los vocabularios español e inglés
-3. Entrena el modelo durante 10 épocas (~1 hora en RTX 3060)
-4. Guarda el modelo y vocabularios en disco
-5. Lanza el modo interactivo para traducir
+1. Detecta que no hay modelo guardado
+2. Descarga el dataset `opus_books` (~93k pares de frases)
+3. Construye los vocabularios español e inglés
+4. Entrena el modelo durante 10 épocas (~1 hora en RTX 3060)
+5. Guarda el modelo y vocabularios en disco
+6. Lanza el modo interactivo para traducir
 
 ### Ejecuciones siguientes (sin reentrenar)
 
-El script detecta automáticamente los archivos guardados y los carga directamente, saltándose el entrenamiento.
+`main.py` detecta automáticamente los archivos guardados y los carga directamente.
+El dataset **no se descarga ni se procesa** — el arranque es inmediato.
 
 ### Archivos generados
 
@@ -99,7 +101,7 @@ El script detecta automáticamente los archivos guardados y los carga directamen
 
 ## Modo interactivo
 
-Al terminar el entrenamiento (o al cargar un modelo ya entrenado), el script muestra ejemplos automáticos y abre un modo interactivo:
+Al terminar el entrenamiento (o al cargar un modelo ya entrenado), `main.py` muestra ejemplos automáticos y abre un modo interactivo:
 
 ```
 ES > el gato duerme en la cama
@@ -115,32 +117,45 @@ Escribe `salir` para terminar.
 
 ---
 
-## Estructura del código
+## Estructura del proyecto
+
+El código está dividido en archivos siguiendo los pasos de la guía original.
+El archivo monolítico `translator-es-en-transformer.py` se mantiene como referencia de aprendizaje.
 
 ```
-translator-es-en-transformer.py
+your-own-transformer/
 │
-├── MultiHeadAttention       # Mecanismo de atención multi-cabeza
-├── PositionWiseFeedForward  # Red feed-forward posición a posición
-├── PositionalEncoding       # Codificación posicional con senos/cosenos
-├── EncoderLayer             # Una capa del encoder
-├── DecoderLayer             # Una capa del decoder
-├── Transformer              # Modelo completo (encoder + decoder)
-│
-├── PASO 5: Preparar datos
-│   ├── Carga opus_books
-│   ├── Construye vocabularios
-│   ├── TranslationDataset
-│   └── DataLoader
-│
-├── PASO 6: Entrenar o cargar
-│   ├── Si existe transformer_model.pt → carga
-│   └── Si no existe → entrena y guarda
-│
-└── PASO 7: Traducir
-    ├── translate()          # Greedy decoding
-    ├── Ejemplos automáticos
-    └── Modo interactivo
+├── main.py          # Punto de entrada — orquesta todo el flujo
+├── config.py        # Hiperparámetros y constantes (device, rutas, vocab_size...)
+├── model.py         # Pasos 1-4: arquitectura completa del Transformer
+├── data.py          # Paso 5: vocabularios, encode(), Dataset, DataLoader
+├── train.py         # Paso 6: bucle de entrenamiento, save/load checkpoint
+└── translate.py     # Paso 7: greedy decoding, modo interactivo
+```
+
+### Contenido de cada archivo
+
+| Archivo | Contiene |
+|---------|----------|
+| `config.py` | `device`, hiperparámetros, rutas de archivos, tokens especiales |
+| `model.py` | `MultiHeadAttention`, `PositionWiseFeedForward`, `PositionalEncoding`, `EncoderLayer`, `DecoderLayer`, `Transformer` |
+| `data.py` | `build_vocab()`, `encode()`, `TranslationDataset`, `load_data()` |
+| `train.py` | `train()`, `save_checkpoint()`, `load_checkpoint()` |
+| `translate.py` | `translate()`, `interactive_mode()` |
+| `main.py` | Flujo principal: cargar o entrenar → traducir |
+
+### Grafo de dependencias
+
+```
+config.py   ← sin dependencias internas
+    ↑
+model.py    ← config.py
+data.py     ← config.py
+    ↑
+train.py    ← config.py
+translate.py← config.py, data.py
+    ↑
+main.py     ← todos
 ```
 
 ---
