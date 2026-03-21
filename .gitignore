@@ -2,3 +2,6 @@
 __pycache__
 transformer_model.pt
 *json
+
+.claude
+CLAUDE.md

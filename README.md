@@ -14,6 +14,8 @@ Entrena un Transformer que aprende a traducir frases del español al inglés usa
 
 ## Arquitectura
 
+![Transformer Pipeline](docs/drawio/technical/flowchart/transformer-pipeline_2026-03-21.svg)
+
 El modelo implementa la arquitectura Transformer completa tal como se describe en el paper original:
 
 ```
